@@ -50,6 +50,19 @@ func TestAccUCloudActiveStandbyRedis_basic(t *testing.T) {
 					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "auto_backup", "disable"),
 				),
 			},
+
+			{
+				// differs from the previous step only by restart_trigger, so this apply
+				// exercises exactly the restart branch and nothing else
+				Config: testAccActiveStandbyRedisConfigRestart,
+
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckActiveStandbyRedisExists("ucloud_redis_instance.foo", &inst),
+					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "name", "tf-acc-redis-renamed"),
+					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "instance_type", "redis-master-2"),
+					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "restart_trigger", "tf-acc-restart-1"),
+				),
+			},
 		},
 	})
 }
@@ -218,6 +231,22 @@ resource "ucloud_redis_instance" "foo" {
 	tag = "tf-acc"
 	backup_begin_time = 0
 	standby_zone = "${data.ucloud_zones.default.zones.1.id}"
+}
+`
+
+const testAccActiveStandbyRedisConfigRestart = `
+data "ucloud_zones" "default" {}
+
+resource "ucloud_redis_instance" "foo" {
+	availability_zone = "${data.ucloud_zones.default.zones.0.id}"
+	engine_version = "4.0"
+	instance_type = "redis-master-2"
+	password = "2018_tfacc"
+	name = "tf-acc-redis-renamed"
+	tag = "tf-acc"
+	backup_begin_time = 0
+	standby_zone = "${data.ucloud_zones.default.zones.1.id}"
+	restart_trigger = "tf-acc-restart-1"
 }
 `
 

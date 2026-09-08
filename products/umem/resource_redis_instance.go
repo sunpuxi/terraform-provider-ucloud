@@ -23,6 +23,7 @@ func resourceUCloudRedisInstance() *schema.Resource {
 			diffValidateRedisInstanceTypeAndEngineVersion,
 			diffValidateRedisStandbyZone,
 			diffValidateBackup,
+			diffValidateRedisRestart,
 			customdiff.ValidateChange("instance_type", diffValidateRedisInstanceType),
 		),
 
@@ -123,6 +124,13 @@ func resourceUCloudRedisInstance() *schema.Resource {
 				ValidateFunc: validation.IntBetween(0, 23),
 			},
 
+			// restart_trigger is an imperative, one-shot knob: changing its value
+			// restarts an active-standby redis. It is not read back from the API.
+			"restart_trigger": {
+				Type:     schema.TypeString,
+				Optional: true,
+			},
+
 			"ip_set": {
 				Type:     schema.TypeList,
 				Computed: true,
@@ -135,6 +143,110 @@ func resourceUCloudRedisInstance() *schema.Resource {
 
 						"port": {
 							Type:     schema.TypeInt,
+							Computed: true,
+						},
+					},
+				},
+			},
+
+			// block_set exposes the shard (block) information of a distributed redis
+			// instance. It is only populated for the distributed instance type and
+			// stays empty for active-standby redis.
+			"block_set": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"block_id": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"block_name": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"block_port": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+
+						"block_read_weight": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+
+						"block_size": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+
+						"block_slot_begin": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+
+						"block_slot_end": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+
+						"block_state": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"block_type": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"block_used_size": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
+
+						"block_vip": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+					},
+				},
+			},
+
+			// read_mode is the cluster level read/write splitting strategy of a
+			// distributed redis instance, reported alongside the shard information.
+			"read_mode": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			// proxy_set exposes the proxy information of a distributed redis instance.
+			// It is only populated for the distributed instance type and stays empty
+			// for active-standby redis.
+			"proxy_set": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"proxy_id": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"resource_id": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"state": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+
+						"vip": {
+							Type:     schema.TypeString,
 							Computed: true,
 						},
 					},
@@ -450,6 +562,25 @@ func updateActiveStandbyRedisInstanceWithoutRead(d *schema.ResourceData, meta in
 		d.SetPartial("backup_begin_time")
 	}
 
+	// A changed restart_trigger requests a one-shot restart. Skipped while the
+	// resource is new so a freshly created instance is not restarted right away.
+	if d.HasChange("restart_trigger") && !d.IsNewResource() {
+		req := conn.NewRestartURedisGroupRequest()
+		req.GroupId = ucloud.String(d.Id())
+
+		if _, err := conn.RestartURedisGroup(req); err != nil {
+			return fmt.Errorf("error on %s to redis instance %q, %s", "RestartURedisGroup", d.Id(), err)
+		}
+		
+		// commit the new trigger before waiting, so a later failure will not re-fire the restart
+		d.SetPartial("restart_trigger")
+
+		// RestartURedisGroup is async; block until the instance is back to Running
+		if err := client.waitActiveStandbyRedisRunning(d.Id()); err != nil {
+			return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "RestartURedisGroup", d.Id(), err)
+		}
+	}
+
 	d.Partial(false)
 	return nil
 }
@@ -570,6 +701,52 @@ func readDistributedRedisInstance(d *schema.ResourceData, meta interface{}) erro
 	}
 
 	if err := d.Set("ip_set", ipSet); err != nil {
+		return err
+	}
+
+	blocks, readMode, err := client.describeDistributedRedisBlockInfoById(d.Id())
+	if err != nil {
+		return fmt.Errorf("error on reading redis block info %q, %s", d.Id(), err)
+	}
+
+	blockSet := []map[string]interface{}{}
+	for _, block := range blocks {
+		blockSet = append(blockSet, map[string]interface{}{
+			"block_id":          block.BlockId,
+			"block_name":        block.BlockName,
+			"block_port":        block.BlockPort,
+			"block_read_weight": block.BlockReadWeight,
+			"block_size":        block.BlockSize,
+			"block_slot_begin":  block.BlockSlotBegin,
+			"block_slot_end":    block.BlockSlotEnd,
+			"block_state":       block.BlockState,
+			"block_type":        block.BlockType,
+			"block_used_size":   block.BlockUsedSize,
+			"block_vip":         block.BlockVip,
+		})
+	}
+
+	if err := d.Set("block_set", blockSet); err != nil {
+		return err
+	}
+	d.Set("read_mode", readMode)
+
+	proxies, err := client.describeDistributedRedisProxyInfoById(d.Id())
+	if err != nil {
+		return fmt.Errorf("error on reading redis proxy info %q, %s", d.Id(), err)
+	}
+
+	proxySet := []map[string]interface{}{}
+	for _, proxy := range proxies {
+		proxySet = append(proxySet, map[string]interface{}{
+			"proxy_id":    proxy.ProxyId,
+			"resource_id": proxy.ResourceId,
+			"state":       proxy.State,
+			"vip":         proxy.Vip,
+		})
+	}
+
+	if err := d.Set("proxy_set", proxySet); err != nil {
 		return err
 	}
 
@@ -762,6 +939,21 @@ func diffValidateBackup(diff *schema.ResourceDiff, meta interface{}) error {
 
 	if !okA && okT {
 		return fmt.Errorf("the argument %q is required when set %q", "auto_backup", "backup_begin_time")
+	}
+
+	return nil
+}
+
+// diffValidateRedisRestart rejects restart_trigger on distributed redis: the SDK only
+// exposes RestartURedisGroup for active-standby redis, with no restart API for distributed.
+func diffValidateRedisRestart(diff *schema.ResourceDiff, meta interface{}) error {
+	t, err := parseRedisInstanceType(diff.Get("instance_type").(string))
+	if err != nil {
+		return err
+	}
+
+	if _, ok := diff.GetOk("restart_trigger"); ok && t.Type == "distributed" {
+		return fmt.Errorf("the argument %q is only supported for active-standby redis, not supported for distributed redis", "restart_trigger")
 	}
 
 	return nil

@@ -56,6 +56,75 @@ func (c *productClient) describeDistributedRedisById(id string) (*umem.UMemSpace
 	return &resp.DataSet[0], nil
 }
 
+// describeDistributedRedisBlockInfoById pulls the shard (block) information of a
+// distributed redis instance. DescribeUMemBlockInfo requires Limit and Offset, so
+// the shards are collected page by page. The returned read mode is the cluster level
+// read/write splitting strategy reported alongside the shard data set.
+func (c *productClient) describeDistributedRedisBlockInfoById(id string) ([]umem.UMemBlockInfo, string, error) {
+	if id == "" {
+		return nil, "", newNotFoundError(getNotFoundMessage("redis", id))
+	}
+	conn := c.umemconn
+
+	limit := 100
+	offset := 0
+	var blocks []umem.UMemBlockInfo
+	var readMode string
+	for {
+		req := conn.NewDescribeUMemBlockInfoRequest()
+		req.SpaceId = ucloud.String(id)
+		req.Limit = ucloud.Int(limit)
+		req.Offset = ucloud.Int(offset)
+
+		resp, err := conn.DescribeUMemBlockInfo(req)
+		if err != nil {
+			return nil, "", err
+		}
+		if resp != nil && resp.GetRetCode() != 0 {
+			return nil, "", fmt.Errorf("error on reading redis block info %q, %s", id, resp.GetMessage())
+		}
+		if resp == nil {
+			break
+		}
+
+		readMode = resp.ReadMode
+		blocks = append(blocks, resp.DataSet...)
+
+		if len(resp.DataSet) < limit {
+			break
+		}
+		offset = offset + limit
+	}
+
+	return blocks, readMode, nil
+}
+
+// describeDistributedRedisProxyInfoById pulls all the proxy information of a
+// distributed redis instance. DescribeUDRedisProxyInfo only requires SpaceId and
+// returns the full proxy data set in a single call.
+func (c *productClient) describeDistributedRedisProxyInfoById(id string) ([]umem.UDRedisProxyInfo, error) {
+	if id == "" {
+		return nil, newNotFoundError(getNotFoundMessage("redis", id))
+	}
+	conn := c.umemconn
+
+	req := conn.NewDescribeUDRedisProxyInfoRequest()
+	req.SpaceId = ucloud.String(id)
+
+	resp, err := conn.DescribeUDRedisProxyInfo(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp != nil && resp.GetRetCode() != 0 {
+		return nil, fmt.Errorf("error on reading redis proxy info %q, %s", id, resp.GetMessage())
+	}
+	if resp == nil {
+		return nil, nil
+	}
+
+	return resp.DataSet, nil
+}
+
 func (c *productClient) describeActiveStandbyMemcacheById(id string) (*pumem.UMemDataSet, error) {
 	if id == "" {
 		return nil, newNotFoundError(getNotFoundMessage("memcache", id))
@@ -78,6 +147,7 @@ func (c *productClient) describeActiveStandbyMemcacheById(id string) (*pumem.UMe
 
 	return &resp.DataSet[0], nil
 }
+
 
 func waitForMemoryInstance(refresh func() (interface{}, string, error)) error {
 	conf := resource.StateChangeConf{

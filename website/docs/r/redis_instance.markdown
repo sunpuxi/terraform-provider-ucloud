@@ -34,6 +34,24 @@ resource "ucloud_redis_instance" "distributed" {
 }
 ```
 
+### Restart an Active-Standby Redis instance
+
+Bump `restart_trigger` to restart the instance in place. The value is arbitrary; setting it to a fresh `timestamp()` restarts on every apply where it changes.
+
+```hcl
+resource "ucloud_redis_instance" "master" {
+  availability_zone = data.ucloud_zones.default.zones[0].id
+  instance_type     = "redis-master-2"
+  password          = "2018_Tfacc"
+  engine_version    = "4.0"
+
+  name = "tf-example-redis-master"
+  tag  = "tf-example"
+
+  restart_trigger = "2026-09-07T10:00:00Z"
+}
+```
+
 ## Argument Reference
 
 The following arguments are supported:
@@ -54,8 +72,11 @@ The following arguments are supported:
 * `password` - (Optional) The password for  active-standby Redis instance which should have 6-36 characters. It must contain at least 3 items of Capital letters, small letter, numbers and special characters. The special characters include `-_`.
 * `auto_backup` - (Optional) Enable or not start auto backup of Redis instance, only support for Active-Standby Redis, possible values are: `enable`, `disable`.
 * `backup_begin_time` - (Optional) Specifies when the backup starts, measured in hour, only support for Active-Standby Redis, it starts at 3 o'clock in the morning by default, possible values are: 0-23.
+* `restart_trigger` - (Optional) A trigger used to request a restart of an Active-Standby Redis instance. Changing its value (for example, to a new timestamp) issues a `RestartURedisGroup` call and waits until the instance returns to `Running`. Only supported for Active-Standby Redis; not supported for Distributed Redis.
 
 ~> **Note** The active-standby Redis doesn't support to be created on multiple zones with Terraform.
+
+~> **Note** `restart_trigger` is an imperative, one-shot action: it does nothing on create, and only fires when its value changes between applies. A common pattern is to set it to `timestamp()` or a version string you bump on demand.
 
 ## Attributes Reference
 
