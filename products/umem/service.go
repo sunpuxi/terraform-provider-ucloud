@@ -60,7 +60,7 @@ func (c *productClient) describeDistributedRedisById(id string) (*umem.UMemSpace
 // distributed redis instance. DescribeUMemBlockInfo requires Limit and Offset, so
 // the shards are collected page by page. The returned read mode is the cluster level
 // read/write splitting strategy reported alongside the shard data set.
-func (c *productClient) describeDistributedRedisBlockInfoById(id string) ([]umem.UMemBlockInfo, string, error) {
+func (c *productClient) describeDistributedRedisBlockInfoById(id, zone string) ([]umem.UMemBlockInfo, string, error) {
 	if id == "" {
 		return nil, "", newNotFoundError(getNotFoundMessage("redis", id))
 	}
@@ -73,6 +73,7 @@ func (c *productClient) describeDistributedRedisBlockInfoById(id string) ([]umem
 	for {
 		req := conn.NewDescribeUMemBlockInfoRequest()
 		req.SpaceId = ucloud.String(id)
+		req.Zone = ucloud.String(zone)
 		req.Limit = ucloud.Int(limit)
 		req.Offset = ucloud.Int(offset)
 
@@ -100,9 +101,10 @@ func (c *productClient) describeDistributedRedisBlockInfoById(id string) ([]umem
 }
 
 // describeDistributedRedisProxyInfoById pulls all the proxy information of a
-// distributed redis instance. DescribeUDRedisProxyInfo only requires SpaceId and
-// returns the full proxy data set in a single call.
-func (c *productClient) describeDistributedRedisProxyInfoById(id string) ([]umem.UDRedisProxyInfo, error) {
+// distributed redis instance. DescribeUDRedisProxyInfo requires SpaceId and
+// the instance zone (the backend rejects the call with "Missing Params
+// [zone_id]" without it) and returns the full proxy data set in a single call.
+func (c *productClient) describeDistributedRedisProxyInfoById(id, zone string) ([]umem.UDRedisProxyInfo, error) {
 	if id == "" {
 		return nil, newNotFoundError(getNotFoundMessage("redis", id))
 	}
@@ -110,6 +112,7 @@ func (c *productClient) describeDistributedRedisProxyInfoById(id string) ([]umem
 
 	req := conn.NewDescribeUDRedisProxyInfoRequest()
 	req.SpaceId = ucloud.String(id)
+	req.Zone = ucloud.String(zone)
 
 	resp, err := conn.DescribeUDRedisProxyInfo(req)
 	if err != nil {
@@ -148,10 +151,19 @@ func (c *productClient) describeActiveStandbyMemcacheById(id string) (*pumem.UMe
 	return &resp.DataSet[0], nil
 }
 
+const (
+	// memoryInstanceWaitTimeout is the wait budget for create/restart/rename
+	// operations on UMem instances.
+	memoryInstanceWaitTimeout = 10 * time.Minute
+	// redisResizeWaitTimeout is the wait budget for capacity resizes. A resize is
+	// an async data migration (distributed redis migrates shard slots) and has
+	// been observed to exceed the former fixed 10m budget.
+	redisResizeWaitTimeout = 60 * time.Minute
+)
 
-func waitForMemoryInstance(refresh func() (interface{}, string, error)) error {
+func waitForMemoryInstance(refresh func() (interface{}, string, error), timeout time.Duration) error {
 	conf := resource.StateChangeConf{
-		Timeout:    10 * time.Minute,
+		Timeout:    timeout,
 		Delay:      3 * time.Second,
 		MinTimeout: 2 * time.Second,
 		Target:     []string{statusInitialized},

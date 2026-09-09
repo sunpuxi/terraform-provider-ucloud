@@ -10,7 +10,7 @@ import (
 	"github.com/terraform-providers/terraform-provider-ucloud/internal/providercompat"
 )
 
-const providerContractBaseline = "284a8f2e6a4dfc2a42be986791e62ac041c767f5"
+const providerContractBaseline = "59257ea990e93a25ee8d733151838f3e5f309ebd"
 
 func TestProviderContract(t *testing.T) {
 	provider := Provider().(*schema.Provider)

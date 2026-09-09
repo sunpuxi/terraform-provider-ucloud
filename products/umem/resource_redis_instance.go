@@ -2,6 +2,7 @@ package umem
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"time"
 
@@ -23,6 +24,7 @@ func resourceUCloudRedisInstance() *schema.Resource {
 			diffValidateRedisInstanceTypeAndEngineVersion,
 			diffValidateRedisStandbyZone,
 			diffValidateBackup,
+			diffValidateBlockCnt,
 			diffValidateRedisRestart,
 			customdiff.ValidateChange("instance_type", diffValidateRedisInstanceType),
 		),
@@ -53,6 +55,20 @@ func resourceUCloudRedisInstance() *schema.Resource {
 				ValidateFunc: validateRedisInstanceType,
 			},
 
+			// block_cnt is the number of shards (blocks) for a distributed redis
+			// instance, sent as CreateUMemSpace's BlockCnt. The backend now requires
+			// it, so when omitted we send defaultDistributedRedisBlockCnt. It is
+			// create-only and ForceNew: shard count cannot be changed in place (a
+			// capacity resize via ResizeUMemSpace keeps the existing shards). Only
+			// valid for the distributed instance type; rejected for active-standby.
+			// The live shards are exposed via the computed block_set attribute.
+			"block_cnt": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				ForceNew:     true,
+				ValidateFunc: validation.IntAtLeast(1),
+			},
+
 			"engine_version": {
 				Type:     schema.TypeString,
 				Optional: true,
@@ -81,16 +97,14 @@ func resourceUCloudRedisInstance() *schema.Resource {
 
 			"vpc_id": {
 				Type:     schema.TypeString,
-				Optional: true,
+				Required: true,
 				ForceNew: true,
-				Computed: true,
 			},
 
 			"subnet_id": {
 				Type:     schema.TypeString,
-				Optional: true,
+				Required: true,
 				ForceNew: true,
-				Computed: true,
 			},
 
 			"password": {
@@ -377,13 +391,8 @@ func createActiveStandbyRedisInstance(d *schema.ResourceData, meta interface{}) 
 		req.ConfigId = ucloud.String(parameterGroupId)
 	}
 
-	if v, ok := d.GetOk("vpc_id"); ok {
-		req.VPCId = ucloud.String(v.(string))
-	}
-
-	if v, ok := d.GetOk("subnet_id"); ok {
-		req.SubnetId = ucloud.String(v.(string))
-	}
+	req.VPCId = ucloud.String(d.Get("vpc_id").(string))
+	req.SubnetId = ucloud.String(d.Get("subnet_id").(string))
 	if v, ok := d.GetOkExists("backup_begin_time"); ok {
 		req.BackupTime = ucloud.Int(v.(int))
 	} else {
@@ -435,12 +444,15 @@ func createDistributedRedisInstance(d *schema.ResourceData, meta interface{}) er
 		req.Name = ucloud.String(resource.PrefixedUniqueId("tf-redis-instance-"))
 	}
 
-	if v, ok := d.GetOk("vpc_id"); ok {
-		req.VPCId = ucloud.String(v.(string))
-	}
+	req.VPCId = ucloud.String(d.Get("vpc_id").(string))
+	req.SubnetId = ucloud.String(d.Get("subnet_id").(string))
 
-	if v, ok := d.GetOk("subnet_id"); ok {
-		req.SubnetId = ucloud.String(v.(string))
+	// BlockCnt (shard count) is required by the backend for distributed redis.
+	// Use the configured block_cnt, falling back to the documented default.
+	if v, ok := d.GetOk("block_cnt"); ok {
+		req.BlockCnt = ucloud.Int(v.(int))
+	} else {
+		req.BlockCnt = ucloud.Int(defaultDistributedRedisBlockCnt)
 	}
 
 	if v, ok := d.GetOk("tag"); ok {
@@ -496,9 +508,10 @@ func updateActiveStandbyRedisInstanceWithoutRead(d *schema.ResourceData, meta in
 	}
 
 	if d.HasChange("instance_type") && !d.IsNewResource() {
+		targetSize := getRedisCapability(d.Get("instance_type").(string))
 		req := conn.NewResizeURedisGroupRequest()
 		req.GroupId = ucloud.String(d.Id())
-		req.Size = ucloud.Int(getRedisCapability(d.Get("instance_type").(string)))
+		req.Size = ucloud.Int(targetSize)
 
 		_, err := conn.ResizeURedisGroup(req)
 		if err != nil {
@@ -506,7 +519,12 @@ func updateActiveStandbyRedisInstanceWithoutRead(d *schema.ResourceData, meta in
 		}
 		d.SetPartial("instance_type")
 
-		if err := client.waitActiveStandbyRedisRunning(d.Id()); err != nil {
+		// Wait for the target size, not just "Running": the resize is async and
+		// right after ResizeURedisGroup returns the instance may still report the
+		// old size with state Running for a moment before flipping to Resizing.
+		// Waiting on Running alone returns early and the following read then
+		// writes the stale size back into state.
+		if err := client.waitActiveStandbyRedisResized(d.Id(), targetSize); err != nil {
 			return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ResizeURedisGroup", d.Id(), err)
 		}
 	}
@@ -571,7 +589,7 @@ func updateActiveStandbyRedisInstanceWithoutRead(d *schema.ResourceData, meta in
 		if _, err := conn.RestartURedisGroup(req); err != nil {
 			return fmt.Errorf("error on %s to redis instance %q, %s", "RestartURedisGroup", d.Id(), err)
 		}
-		
+
 		// commit the new trigger before waiting, so a later failure will not re-fire the restart
 		d.SetPartial("restart_trigger")
 
@@ -598,6 +616,8 @@ func updateDistributedRedisInstance(d *schema.ResourceData, meta interface{}) er
 		req := conn.NewModifyUMemSpaceNameRequest()
 		req.SpaceId = ucloud.String(d.Id())
 		req.Name = ucloud.String(d.Get("name").(string))
+		// the UMemSpace API family validates the zone common param on the backend
+		req.Zone = ucloud.String(d.Get("availability_zone").(string))
 
 		_, err := conn.ModifyUMemSpaceName(req)
 		if err != nil {
@@ -611,19 +631,10 @@ func updateDistributedRedisInstance(d *schema.ResourceData, meta interface{}) er
 	}
 
 	if d.HasChange("instance_type") && !d.IsNewResource() {
-		req := conn.NewResizeUMemSpaceRequest()
-		req.SpaceId = ucloud.String(d.Id())
-		req.Size = ucloud.Int(getRedisCapability(d.Get("instance_type").(string)))
-
-		_, err := conn.ResizeUMemSpace(req)
-		if err != nil {
-			return fmt.Errorf("error on %s to redis instance %q, %s", "ResizeUMemSpace", d.Id(), err)
+		if err := resizeDistributedRedisInstance(client, d); err != nil {
+			return err
 		}
 		d.SetPartial("instance_type")
-
-		if err := client.waitDistributedRedisRunning(d.Id()); err != nil {
-			return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ResizeUMemSpace", d.Id(), err)
-		}
 	}
 
 	d.Partial(false)
@@ -665,6 +676,14 @@ func readActiveStandbyRedisInstance(d *schema.ResourceData, meta interface{}) er
 	d.Set("create_time", timestampToString(inst.CreateTime))
 	d.Set("expire_time", timestampToString(inst.ExpireTime))
 	d.Set("status", inst.State)
+
+	// block_set / proxy_set / read_mode are distributed-redis-only attributes on
+	// the shared schema. Set them empty for active-standby instances: a computed
+	// attribute absent from state is marked <computed> in every subsequent plan,
+	// producing a perpetual diff.
+	d.Set("block_set", []map[string]interface{}{})
+	d.Set("proxy_set", []map[string]interface{}{})
+	d.Set("read_mode", "")
 	return nil
 }
 
@@ -704,9 +723,21 @@ func readDistributedRedisInstance(d *schema.ResourceData, meta interface{}) erro
 		return err
 	}
 
-	blocks, readMode, err := client.describeDistributedRedisBlockInfoById(d.Id())
+	// block_set / read_mode / proxy_set are auxiliary computed attributes.
+	// DescribeUMemBlockInfo / DescribeUDRedisProxyInfo are not accessible for
+	// every account/region (observed: RetCode 200 "Get names errorget access
+	// failed"). Never fail the whole read over them: a failing read also breaks
+	// the refresh that `terraform destroy` performs, which would strand a
+	// created instance. Log a warning and fall back to empty values.
+	//
+	// The attributes are ALWAYS written, even when empty: a computed attribute
+	// absent from state is marked <computed> in every subsequent plan, which
+	// produces a perpetual diff (the acceptance framework rejects that with
+	// "the plan was not empty").
+	blocks, readMode, err := client.describeDistributedRedisBlockInfoById(d.Id(), inst.Zone)
 	if err != nil {
-		return fmt.Errorf("error on reading redis block info %q, %s", d.Id(), err)
+		log.Printf("[WARN] could not read block info of redis instance %q: %s", d.Id(), err)
+		blocks, readMode = nil, ""
 	}
 
 	blockSet := []map[string]interface{}{}
@@ -731,9 +762,10 @@ func readDistributedRedisInstance(d *schema.ResourceData, meta interface{}) erro
 	}
 	d.Set("read_mode", readMode)
 
-	proxies, err := client.describeDistributedRedisProxyInfoById(d.Id())
+	proxies, err := client.describeDistributedRedisProxyInfoById(d.Id(), inst.Zone)
 	if err != nil {
-		return fmt.Errorf("error on reading redis proxy info %q, %s", d.Id(), err)
+		log.Printf("[WARN] could not read proxy info of redis instance %q: %s", d.Id(), err)
+		proxies = nil
 	}
 
 	proxySet := []map[string]interface{}{}
@@ -790,6 +822,10 @@ func deleteDistributedRedisInstance(d *schema.ResourceData, meta interface{}) *r
 
 	req := conn.NewDeleteUMemSpaceRequest()
 	req.SpaceId = ucloud.String(d.Id())
+	// DeleteUMemSpace validates the zone common param on the backend
+	// ("Missing Params [zone_id]" without it); availability_zone is kept in
+	// state by the read path.
+	req.Zone = ucloud.String(d.Get("availability_zone").(string))
 	if _, err := conn.DeleteUMemSpace(req); err != nil {
 		return resource.NonRetryableError(fmt.Errorf("error on deleting redis instance %q, %s", d.Id(), err))
 	}
@@ -864,7 +900,7 @@ func (c *productClient) waitActiveStandbyRedisRunning(id string) error {
 		return resp, statusInitialized, nil
 	}
 
-	return waitForMemoryInstance(refresh)
+	return waitForMemoryInstance(refresh, memoryInstanceWaitTimeout)
 }
 
 func (c *productClient) waitDistributedRedisRunning(id string) error {
@@ -883,13 +919,184 @@ func (c *productClient) waitDistributedRedisRunning(id string) error {
 		return resp, statusInitialized, nil
 	}
 
-	return waitForMemoryInstance(refresh)
+	return waitForMemoryInstance(refresh, memoryInstanceWaitTimeout)
+}
+
+// waitActiveStandbyRedisResized blocks until the instance is Running AND reports
+// the target size in GB. Waiting on "Running" alone races with the async resize:
+// right after ResizeURedisGroup returns, the instance can still show the old size
+// with state Running before the backend flips it to Resizing, so a Running-only
+// wait returns early and the subsequent read persists the stale size.
+func (c *productClient) waitActiveStandbyRedisResized(id string, size int) error {
+	refresh := func() (interface{}, string, error) {
+		resp, err := c.describeActiveStandbyRedisById(id)
+		if err != nil {
+			if isNotFoundError(err) {
+				return nil, statusPending, nil
+			}
+			return nil, "", err
+		}
+
+		// surface a failed resize immediately instead of polling until timeout
+		if resp.State == statusResizeFail || resp.State == statusFail {
+			return nil, "", fmt.Errorf("resize of redis instance %q failed, instance state: %q", id, resp.State)
+		}
+
+		if resp.State != statusRunning || resp.Size != size {
+			return resp, statusPending, nil
+		}
+		return resp, statusInitialized, nil
+	}
+
+	return waitForMemoryInstance(refresh, redisResizeWaitTimeout)
+}
+
+// waitDistributedRedisResized blocks until the instance is Running AND reports
+// the target size in GB; see waitActiveStandbyRedisResized for why a Running-only
+// wait is not enough after ResizeUMemSpace.
+func (c *productClient) waitDistributedRedisResized(id string, size int) error {
+	refresh := func() (interface{}, string, error) {
+		resp, err := c.describeDistributedRedisById(id)
+		if err != nil {
+			if isNotFoundError(err) {
+				return nil, statusPending, nil
+			}
+			return nil, "", err
+		}
+
+		// surface a failed resize immediately instead of polling until timeout
+		if resp.State == statusResizeFail || resp.State == statusFail {
+			return nil, "", fmt.Errorf("resize of redis instance %q failed, instance state: %q", id, resp.State)
+		}
+
+		if resp.State != statusRunning || resp.Size != size {
+			return resp, statusPending, nil
+		}
+		return resp, statusInitialized, nil
+	}
+
+	return waitForMemoryInstance(refresh, redisResizeWaitTimeout)
+}
+
+// udredisBlockSizes are the per-shard capacities (GB) accepted by
+// ResizeUDRedisBlockSize.
+var udredisBlockSizes = []int{4, 8, 12, 16, 20}
+
+// resizeDistributedRedisInstance grows a distributed redis (UDRedis) instance.
+//
+// UDRedis capacity is shardCount x per-shard size, and resizing happens per
+// shard through ResizeUDRedisBlockSize (BlockId required, per-shard capacity
+// restricted to 4/8/12/16/20 GB). ResizeUMemSpace must NOT be used here: the
+// backend accepts it with RetCode 0 but never starts a resize for a UDRedis
+// instance - no shard enters Resizing and the total size never changes.
+//
+// Shards are resized one by one and the loop is idempotent (a shard already at
+// the target size is skipped), so a partially failed resize can simply be
+// retried on the next apply.
+func resizeDistributedRedisInstance(client *productClient, d *schema.ResourceData) error {
+	conn := client.umemconn
+	id := d.Id()
+	zone := d.Get("availability_zone").(string)
+	targetTotal := getRedisCapability(d.Get("instance_type").(string))
+
+	blocks, _, err := client.describeDistributedRedisBlockInfoById(id, zone)
+	if err != nil {
+		return fmt.Errorf("error on listing shards of redis instance %q before resizing (distributed resize requires DescribeUMemBlockInfo access): %s", id, err)
+	}
+	if len(blocks) == 0 {
+		return fmt.Errorf("cannot resize redis instance %q: no shard information returned by DescribeUMemBlockInfo", id)
+	}
+
+	if targetTotal%len(blocks) != 0 {
+		return fmt.Errorf("cannot resize redis instance %q: total size %dGB is not divisible by its %d shards", id, targetTotal, len(blocks))
+	}
+	targetBlockSize := targetTotal / len(blocks)
+	validSize := false
+	for _, size := range udredisBlockSizes {
+		if size == targetBlockSize {
+			validSize = true
+			break
+		}
+	}
+	if !validSize {
+		return fmt.Errorf("cannot resize redis instance %q: per-shard size %dGB is invalid, must be one of 4/8/12/16/20GB", id, targetBlockSize)
+	}
+
+	for _, block := range blocks {
+		if block.BlockSize == targetBlockSize {
+			continue // already at target, e.g. retrying a partially failed resize
+		}
+
+		req := conn.NewResizeUDRedisBlockSizeRequest()
+		req.SpaceId = ucloud.String(id)
+		req.Zone = ucloud.String(zone)
+		req.BlockId = ucloud.String(block.BlockId)
+		req.BlockSize = ucloud.Int(targetBlockSize)
+
+		if _, err := conn.ResizeUDRedisBlockSize(req); err != nil {
+			return fmt.Errorf("error on resizing shard %q of redis instance %q, %s", block.BlockId, id, err)
+		}
+
+		if err := client.waitDistributedRedisBlockResized(id, zone, block.BlockId, targetBlockSize); err != nil {
+			return fmt.Errorf("error on waiting for shard %q of redis instance %q complete resizing, %s", block.BlockId, id, err)
+		}
+	}
+
+	// final space-level consistency wait: Running and the total size reached
+	return client.waitDistributedRedisResized(id, targetTotal)
+}
+
+// waitDistributedRedisBlockResized blocks until the given shard reports Running
+// with the target per-shard size, failing fast on a terminal shard failure state.
+func (c *productClient) waitDistributedRedisBlockResized(id, zone, blockId string, size int) error {
+	refresh := func() (interface{}, string, error) {
+		blocks, _, err := c.describeDistributedRedisBlockInfoById(id, zone)
+		if err != nil {
+			if isNotFoundError(err) {
+				return nil, statusPending, nil
+			}
+			return nil, "", err
+		}
+		for _, block := range blocks {
+			if block.BlockId != blockId {
+				continue
+			}
+			if block.BlockState == statusResizeFail || block.BlockState == statusFail {
+				return nil, "", fmt.Errorf("resize of shard %q failed, shard state: %q", blockId, block.BlockState)
+			}
+			if block.BlockState == statusRunning && block.BlockSize == size {
+				return block, statusInitialized, nil
+			}
+			return block, statusPending, nil
+		}
+		return nil, "", fmt.Errorf("shard %q of redis instance %q disappeared during resize", blockId, id)
+	}
+
+	return waitForMemoryInstance(refresh, redisResizeWaitTimeout)
+}
+
+// diffIsDestroyPlan reports whether the diff was produced for a destroy plan.
+// SDKv1 still runs CustomizeDiff while planning a destroy with an empty config
+// (schemaMap.Diff only skips it for DestroyTainted), where required fields read
+// back as nil/zero values: type assertions panic and GetOk/GetOkExists disagree,
+// which previously surfaced as spurious errors during acceptance-test cleanup.
+// instance_type is Required on both redis and memcache, so an absent value
+// means there is no new configuration to validate.
+func diffIsDestroyPlan(diff *schema.ResourceDiff) bool {
+	v, _ := diff.Get("instance_type").(string)
+	return v == ""
 }
 
 func diffValidateRedisInstanceType(old, new, meta interface{}) error {
-	if len(old.(string)) > 0 {
-		oldType, _ := parseRedisInstanceType(old.(string))
-		newType, _ := parseRedisInstanceType(new.(string))
+	oldValue, _ := old.(string)
+	newValue, _ := new.(string)
+	if newValue == "" {
+		// destroy plan: no new configuration to validate
+		return nil
+	}
+	if len(oldValue) > 0 {
+		oldType, _ := parseRedisInstanceType(oldValue)
+		newType, _ := parseRedisInstanceType(newValue)
 		if newType.Type != oldType.Type {
 			return fmt.Errorf("redis instance is not supported update the type of %q", "instance_type")
 		}
@@ -902,8 +1109,13 @@ func diffValidateRedisInstanceType(old, new, meta interface{}) error {
 }
 
 func diffValidateRedisInstanceTypeAndEngineVersion(diff *schema.ResourceDiff, v interface{}) error {
-	engineVersion := diff.Get("engine_version").(string)
-	redisType, _ := parseRedisInstanceType(diff.Get("instance_type").(string))
+	if diffIsDestroyPlan(diff) {
+		return nil
+	}
+
+	engineVersion, _ := diff.Get("engine_version").(string)
+	instanceType, _ := diff.Get("instance_type").(string)
+	redisType, _ := parseRedisInstanceType(instanceType)
 
 	if redisType.Type == "master" && engineVersion == "" {
 		return fmt.Errorf("the %q argument must be set to active-standby redis instance", "engine_version")
@@ -917,7 +1129,11 @@ func diffValidateRedisInstanceTypeAndEngineVersion(diff *schema.ResourceDiff, v 
 }
 
 func diffValidateRedisStandbyZone(diff *schema.ResourceDiff, v interface{}) error {
-	zone := diff.Get("availability_zone").(string)
+	if diffIsDestroyPlan(diff) {
+		return nil
+	}
+
+	zone, _ := diff.Get("availability_zone").(string)
 
 	if val, ok := diff.GetOk("standby_zone"); ok && val.(string) == zone {
 		return fmt.Errorf("standby_zone %q must be different from availability_zone %q", val.(string), zone)
@@ -927,9 +1143,14 @@ func diffValidateRedisStandbyZone(diff *schema.ResourceDiff, v interface{}) erro
 }
 
 func diffValidateBackup(diff *schema.ResourceDiff, meta interface{}) error {
+	if diffIsDestroyPlan(diff) {
+		return nil
+	}
+
 	_, okT := diff.GetOkExists("backup_begin_time")
 	_, okA := diff.GetOk("auto_backup")
-	t, err := parseRedisInstanceType(diff.Get("instance_type").(string))
+	instanceType, _ := diff.Get("instance_type").(string)
+	t, err := parseRedisInstanceType(instanceType)
 	if err != nil {
 		return err
 	}
@@ -944,10 +1165,36 @@ func diffValidateBackup(diff *schema.ResourceDiff, meta interface{}) error {
 	return nil
 }
 
+// diffValidateBlockCnt rejects block_cnt on active-standby redis: sharding only
+// applies to the distributed instance type (CreateUMemSpace), not to the
+// active-standby URedisGroup path.
+func diffValidateBlockCnt(diff *schema.ResourceDiff, meta interface{}) error {
+	if diffIsDestroyPlan(diff) {
+		return nil
+	}
+
+	instanceType, _ := diff.Get("instance_type").(string)
+	t, err := parseRedisInstanceType(instanceType)
+	if err != nil {
+		return err
+	}
+
+	if _, ok := diff.GetOk("block_cnt"); ok && t.Type != "distributed" {
+		return fmt.Errorf("the argument %q is only supported for distributed redis, not supported for active-standby redis", "block_cnt")
+	}
+
+	return nil
+}
+
 // diffValidateRedisRestart rejects restart_trigger on distributed redis: the SDK only
 // exposes RestartURedisGroup for active-standby redis, with no restart API for distributed.
 func diffValidateRedisRestart(diff *schema.ResourceDiff, meta interface{}) error {
-	t, err := parseRedisInstanceType(diff.Get("instance_type").(string))
+	if diffIsDestroyPlan(diff) {
+		return nil
+	}
+
+	instanceType, _ := diff.Get("instance_type").(string)
+	t, err := parseRedisInstanceType(instanceType)
 	if err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@ package umem_test
 import (
 	"fmt"
 	"log"
+	"os"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
@@ -95,7 +96,7 @@ func TestAccUCloudDistributedRedis_basic(t *testing.T) {
 
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckDistributedRedisExists("ucloud_redis_instance.foo", &inst),
-					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "instance_type", "redis-distributed-20"),
+					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "instance_type", "redis-distributed-32"),
 					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "name", "tf-acc-redis-renamed"),
 				),
 			},
@@ -205,7 +206,11 @@ func testAccCheckDistributedRedisDestroy(state *terraform.State) error {
 	return nil
 }
 
-const testAccActiveStandbyRedisConfig = `
+// The acceptance suite reuses one pre-created VPC/subnet (the UCloud region
+// under test no longer sells classic-network UMem/URedis). Export UCLOUD_VPC_ID
+// and UCLOUD_SUBNET_ID before running `make testacc PRODUCT=umem`; testAccPreCheck
+// fails fast when either is missing.
+var testAccActiveStandbyRedisConfig = fmt.Sprintf(`
 data "ucloud_zones" "default" {}
 
 resource "ucloud_redis_instance" "foo" {
@@ -215,11 +220,13 @@ resource "ucloud_redis_instance" "foo" {
 	password = "2018_tfacc"
 	name = "tf-acc-redis"
 	tag = "tf-acc"
+	vpc_id = "%s"
+	subnet_id = "%s"
 	standby_zone = "${data.ucloud_zones.default.zones.1.id}"
 }
-`
+`, os.Getenv("UCLOUD_VPC_ID"), os.Getenv("UCLOUD_SUBNET_ID"))
 
-const testAccActiveStandbyRedisConfigUpdate = `
+var testAccActiveStandbyRedisConfigUpdate = fmt.Sprintf(`
 data "ucloud_zones" "default" {}
 
 resource "ucloud_redis_instance" "foo" {
@@ -229,12 +236,15 @@ resource "ucloud_redis_instance" "foo" {
 	password = "2018_tfacc"
 	name = "tf-acc-redis-renamed"
 	tag = "tf-acc"
+	vpc_id = "%s"
+	subnet_id = "%s"
+	auto_backup = "disable"
 	backup_begin_time = 0
 	standby_zone = "${data.ucloud_zones.default.zones.1.id}"
 }
-`
+`, os.Getenv("UCLOUD_VPC_ID"), os.Getenv("UCLOUD_SUBNET_ID"))
 
-const testAccActiveStandbyRedisConfigRestart = `
+var testAccActiveStandbyRedisConfigRestart = fmt.Sprintf(`
 data "ucloud_zones" "default" {}
 
 resource "ucloud_redis_instance" "foo" {
@@ -244,13 +254,16 @@ resource "ucloud_redis_instance" "foo" {
 	password = "2018_tfacc"
 	name = "tf-acc-redis-renamed"
 	tag = "tf-acc"
+	vpc_id = "%s"
+	subnet_id = "%s"
+	auto_backup = "disable"
 	backup_begin_time = 0
 	standby_zone = "${data.ucloud_zones.default.zones.1.id}"
 	restart_trigger = "tf-acc-restart-1"
 }
-`
+`, os.Getenv("UCLOUD_VPC_ID"), os.Getenv("UCLOUD_SUBNET_ID"))
 
-const testAccDistributedRedisConfig = `
+var testAccDistributedRedisConfig = fmt.Sprintf(`
 data "ucloud_zones" "default" {}
 
 resource "ucloud_redis_instance" "foo" {
@@ -258,16 +271,22 @@ resource "ucloud_redis_instance" "foo" {
 	name = "tf-acc-redis"
 	tag = "tf-acc"
 	instance_type = "redis-distributed-16"
+	block_cnt = 4
+	vpc_id = "%s"
+	subnet_id = "%s"
 }
-`
+`, os.Getenv("UCLOUD_VPC_ID"), os.Getenv("UCLOUD_SUBNET_ID"))
 
-const testAccDistributedRedisConfigUpdate = `
+var testAccDistributedRedisConfigUpdate = fmt.Sprintf(`
 data "ucloud_zones" "default" {}
 
 resource "ucloud_redis_instance" "foo" {
 	availability_zone = "${data.ucloud_zones.default.zones.0.id}"
 	name = "tf-acc-redis-renamed"
 	tag = "tf-acc"
-	instance_type = "redis-distributed-20"
+	instance_type = "redis-distributed-32"
+	block_cnt = 4
+	vpc_id = "%s"
+	subnet_id = "%s"
 }
-`
+`, os.Getenv("UCLOUD_VPC_ID"), os.Getenv("UCLOUD_SUBNET_ID"))
