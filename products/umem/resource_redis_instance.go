@@ -145,6 +145,15 @@ func resourceUCloudRedisInstance() *schema.Resource {
 				Optional: true,
 			},
 
+			// transform_type is a optionalknob:changing redis instance state from "Running" or "ISolation"
+			// if user wants to shutdown a redis active-standby instance, sets transform_type to "UNBind"
+			// if user wants to start a redis active-standby instance, sets transform_type to "Bind"
+			"transform_type": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				ValidateFunc: validation.StringInSlice([]string{"UNBind", "Bind"}, false),
+			},
+
 			"ip_set": {
 				Type:     schema.TypeList,
 				Computed: true,
@@ -580,9 +589,44 @@ func updateActiveStandbyRedisInstanceWithoutRead(d *schema.ResourceData, meta in
 		d.SetPartial("backup_begin_time")
 	}
 
+	// Bind or UNBind redis. active-standby redis instance can be shutdown or
+	// started via transform_type. This branch must run BEFORE the restart branch
+	// below: RestartURedisGroup is rejected by the backend (RetCode 21018) while
+	// the instance is isolated, so a combined "Bind + restart" apply has to bring
+	// the instance back to Running first.
+	if d.HasChange("transform_type") && !d.IsNewResource() {
+		transformType := d.Get("transform_type").(string)
+
+		req := conn.NewISolationURedisGroupRequest()
+		req.GroupId = ucloud.String(d.Id())
+		req.TransformType = ucloud.String(transformType)
+
+		if _, err := conn.ISolationURedisGroup(req); err != nil {
+			return fmt.Errorf("error on %s to redis instance %q, %s", "ISolationURedisGroup", d.Id(), err)
+		}
+
+		d.SetPartial("transform_type")
+
+		if err := client.waitActiveStandbyRedisTransform(d.Id(), transformType); err != nil {
+			return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ISolationURedisGroup", d.Id(), err)
+		}
+	}
+
 	// A changed restart_trigger requests a one-shot restart. Skipped while the
 	// resource is new so a freshly created instance is not restarted right away.
 	if d.HasChange("restart_trigger") && !d.IsNewResource() {
+		// RestartURedisGroup only works on a Running instance; the backend rejects
+		// an isolated one with an opaque RetCode 21018. Fail with a clear message
+		// instead (the transform branch above has already applied any Bind/UNBind
+		// requested in the same apply).
+		inst, err := client.describeActiveStandbyRedisById(d.Id())
+		if err != nil {
+			return fmt.Errorf("error on reading redis instance %q before restart, %s", d.Id(), err)
+		}
+		if inst.State != statusRunning {
+			return fmt.Errorf("cannot restart redis instance %q in state %q: the instance must be Running, set transform_type to %q to start an isolated instance first", d.Id(), inst.State, "Bind")
+		}
+
 		req := conn.NewRestartURedisGroupRequest()
 		req.GroupId = ucloud.String(d.Id())
 
@@ -895,6 +939,36 @@ func (c *productClient) waitActiveStandbyRedisRunning(id string) error {
 		}
 
 		if resp.State != statusRunning {
+			return resp, statusPending, nil
+		}
+		return resp, statusInitialized, nil
+	}
+
+	return waitForMemoryInstance(refresh, memoryInstanceWaitTimeout)
+}
+
+// waitActiveStandbyRedisTransform blocks until an ISolationURedisGroup transform
+// reaches its target state: "Bind" ends in Running, "UNBind" ends in ISolation.
+// The transform is async and the instance still reports the OLD state right
+// after the API returns, so a wait accepting both states would return
+// immediately and the next operation (e.g. a restart after Bind) would run
+// against an instance that has not come back up yet.
+func (c *productClient) waitActiveStandbyRedisTransform(id, transformType string) error {
+	targetState := statusUNBind
+	if transformType == "Bind" {
+		targetState = statusRunning
+	}
+
+	refresh := func() (interface{}, string, error) {
+		resp, err := c.describeActiveStandbyRedisById(id)
+		if err != nil {
+			if isNotFoundError(err) {
+				return nil, statusPending, nil
+			}
+			return nil, "", err
+		}
+
+		if resp.State != targetState {
 			return resp, statusPending, nil
 		}
 		return resp, statusInitialized, nil

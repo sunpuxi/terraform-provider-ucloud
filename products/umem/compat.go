@@ -27,6 +27,9 @@ const (
 	// UMemSpaceSet state docs in the SDK): fail fast instead of polling to timeout
 	statusFail       = "Fail"
 	statusResizeFail = "ResizeFail"
+
+	// UNBind
+	statusUNBind = "ISolation"
 )
 
 type providerError struct {

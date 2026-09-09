@@ -49,12 +49,23 @@ func TestAccUCloudActiveStandbyRedis_basic(t *testing.T) {
 					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "engine_version", "4.0"),
 					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "backup_begin_time", "0"),
 					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "auto_backup", "disable"),
+					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "status", "ISolation"),
+				),
+			},
+
+			{
+				Config: testAccActiveStandbyRedisConfigShutDown,
+
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckActiveStandbyRedisExists("ucloud_redis_instance.foo", &inst),
+					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "status", "Running"),
 				),
 			},
 
 			{
 				// differs from the previous step only by restart_trigger, so this apply
-				// exercises exactly the restart branch and nothing else
+				// exercises exactly the restart branch and nothing else; the instance
+				// is Running here, which RestartURedisGroup requires
 				Config: testAccActiveStandbyRedisConfigRestart,
 
 				Check: resource.ComposeTestCheckFunc(
@@ -62,6 +73,7 @@ func TestAccUCloudActiveStandbyRedis_basic(t *testing.T) {
 					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "name", "tf-acc-redis-renamed"),
 					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "instance_type", "redis-master-2"),
 					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "restart_trigger", "tf-acc-restart-1"),
+					resource.TestCheckResourceAttr("ucloud_redis_instance.foo", "status", "Running"),
 				),
 			},
 		},
@@ -241,6 +253,7 @@ resource "ucloud_redis_instance" "foo" {
 	auto_backup = "disable"
 	backup_begin_time = 0
 	standby_zone = "${data.ucloud_zones.default.zones.1.id}"
+	transform_type = "UNBind"
 }
 `, os.Getenv("UCLOUD_VPC_ID"), os.Getenv("UCLOUD_SUBNET_ID"))
 
@@ -259,7 +272,32 @@ resource "ucloud_redis_instance" "foo" {
 	auto_backup = "disable"
 	backup_begin_time = 0
 	standby_zone = "${data.ucloud_zones.default.zones.1.id}"
+	transform_type = "Bind"
 	restart_trigger = "tf-acc-restart-1"
+}
+`, os.Getenv("UCLOUD_VPC_ID"), os.Getenv("UCLOUD_SUBNET_ID"))
+
+// testAccActiveStandbyRedisConfigShutDown starts the instance back up
+// (transform_type = "Bind") after the previous step isolated it. It must NOT
+// set restart_trigger: the restart step below has to differ from this one only
+// by restart_trigger, and a restart fired while the instance is still isolated
+// is rejected by the backend (RetCode 21018).
+var testAccActiveStandbyRedisConfigShutDown = fmt.Sprintf(`
+data "ucloud_zones" "default" {}
+
+resource "ucloud_redis_instance" "foo" {
+	availability_zone = "${data.ucloud_zones.default.zones.0.id}"
+	engine_version = "4.0"
+	instance_type = "redis-master-2"
+	password = "2018_tfacc"
+	name = "tf-acc-redis-renamed"
+	tag = "tf-acc"
+	vpc_id = "%s"
+	subnet_id = "%s"
+	auto_backup = "disable"
+	backup_begin_time = 0
+	standby_zone = "${data.ucloud_zones.default.zones.1.id}"
+	transform_type = "Bind"
 }
 `, os.Getenv("UCLOUD_VPC_ID"), os.Getenv("UCLOUD_SUBNET_ID"))
 
@@ -271,7 +309,7 @@ resource "ucloud_redis_instance" "foo" {
 	name = "tf-acc-redis"
 	tag = "tf-acc"
 	instance_type = "redis-distributed-16"
-	block_cnt = 4
+	block_cnt = 2
 	vpc_id = "%s"
 	subnet_id = "%s"
 }
@@ -285,7 +323,7 @@ resource "ucloud_redis_instance" "foo" {
 	name = "tf-acc-redis-renamed"
 	tag = "tf-acc"
 	instance_type = "redis-distributed-32"
-	block_cnt = 4
+	block_cnt = 2
 	vpc_id = "%s"
 	subnet_id = "%s"
 }
