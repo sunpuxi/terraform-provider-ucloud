@@ -496,154 +496,211 @@ func updateActiveStandbyRedisInstanceWithoutRead(d *schema.ResourceData, meta in
 	if err != nil {
 		return fmt.Errorf("error on getting client when updating redis instance, %s", err)
 	}
-	conn := client.umemconn
 
 	d.Partial(true)
 
+	// Each branch applies one in-place change through its own helper following
+	// the same call -> SetPartial -> wait shape, and blocks until the instance
+	// settles again. Only transform/restart below are order-sensitive.
+
 	if d.HasChange("name") && !d.IsNewResource() {
-		req := conn.NewModifyURedisGroupNameRequest()
-		req.GroupId = ucloud.String(d.Id())
-		req.Name = ucloud.String(d.Get("name").(string))
-
-		_, err := conn.ModifyURedisGroupName(req)
-		if err != nil {
-			return fmt.Errorf("error on %s to redis instance %q, %s", "ModifyURedisGroupName", d.Id(), err)
-		}
-		d.SetPartial("name")
-
-		if err := client.waitActiveStandbyRedisRunning(d.Id()); err != nil {
-			return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ModifyURedisGroupName", d.Id(), err)
+		if err := renameActiveStandbyRedis(client, d); err != nil {
+			return err
 		}
 	}
 
 	if d.HasChange("instance_type") && !d.IsNewResource() {
-		targetSize := getRedisCapability(d.Get("instance_type").(string))
-		req := conn.NewResizeURedisGroupRequest()
-		req.GroupId = ucloud.String(d.Id())
-		req.Size = ucloud.Int(targetSize)
-
-		_, err := conn.ResizeURedisGroup(req)
-		if err != nil {
-			return fmt.Errorf("error on %s to redis instance %q, %s", "ResizeURedisGroup", d.Id(), err)
-		}
-		d.SetPartial("instance_type")
-
-		// Wait for the target size, not just "Running": the resize is async and
-		// right after ResizeURedisGroup returns the instance may still report the
-		// old size with state Running for a moment before flipping to Resizing.
-		// Waiting on Running alone returns early and the following read then
-		// writes the stale size back into state.
-		if err := client.waitActiveStandbyRedisResized(d.Id(), targetSize); err != nil {
-			return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ResizeURedisGroup", d.Id(), err)
+		if err := resizeActiveStandbyRedis(client, d); err != nil {
+			return err
 		}
 	}
 
 	if d.HasChange("password") && !d.IsNewResource() {
-		password := d.Get("password").(string)
-
-		req := client.pumemconn.NewModifyURedisGroupPasswordRequest()
-		req.GroupId = ucloud.String(d.Id())
-		req.Password = ucloud.String(password)
-
-		_, err := client.pumemconn.ModifyURedisGroupPassword(req)
-		if err != nil {
-			return fmt.Errorf("error on %s to redis instance %q, %s", "ModifyURedisGroupPassword", d.Id(), err)
-		}
-		d.SetPartial("password")
-
-		if err := client.waitActiveStandbyRedisRunning(d.Id()); err != nil {
-			return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ModifyURedisGroupPassword", d.Id(), err)
+		if err := modifyActiveStandbyRedisPassword(client, d); err != nil {
+			return err
 		}
 	}
 
-	backupChanged := false
-	buReq := conn.NewUpdateURedisBackupStrategyRequest()
-	buReq.GroupId = ucloud.String(d.Id())
-
-	if d.HasChange("backup_begin_time") && !d.IsNewResource() {
-		backupChanged = true
+	// UpdateURedisBackupStrategy takes the full strategy, so a change to either
+	// attribute re-sends both
+	if (d.HasChange("backup_begin_time") || d.HasChange("auto_backup")) && !d.IsNewResource() {
+		if err := updateActiveStandbyRedisBackup(client, d); err != nil {
+			return err
+		}
 	}
 
-	if d.HasChange("auto_backup") && !d.IsNewResource() {
-		backupChanged = true
-	}
-
-	if backupChanged {
-		if v, ok := d.GetOkExists("backup_begin_time"); ok {
-			buReq.BackupTime = ucloud.String(strconv.Itoa(v.(int)))
-		} else {
-			buReq.BackupTime = ucloud.String("3")
-		}
-
-		if v, ok := d.GetOk("auto_backup"); ok {
-			buReq.AutoBackup = ucloud.String(v.(string))
-		} else {
-			buReq.AutoBackup = ucloud.String("disable")
-		}
-
-		if _, err := conn.UpdateURedisBackupStrategy(buReq); err != nil {
-			return fmt.Errorf("error on %s to redis instance %q, %s", "UpdateURedisBackupStrategy", d.Id(), err)
-		}
-
-		d.SetPartial("auto_backup")
-		d.SetPartial("backup_begin_time")
-	}
-
-	// Bind or UNBind redis. active-standby redis instance can be shutdown or
-	// started via transform_type. This branch must run BEFORE the restart branch
-	// below: RestartURedisGroup is rejected by the backend (RetCode 21018) while
-	// the instance is isolated, so a combined "Bind + restart" apply has to bring
-	// the instance back to Running first.
+	// Bind or UNBind must run BEFORE the restart below: RestartURedisGroup is
+	// rejected by the backend (RetCode 21018) while the instance is isolated, so
+	// a combined "Bind + restart" apply has to bring the instance back to Running
+	// first.
 	if d.HasChange("transform_type") && !d.IsNewResource() {
-		transformType := d.Get("transform_type").(string)
-
-		req := conn.NewISolationURedisGroupRequest()
-		req.GroupId = ucloud.String(d.Id())
-		req.TransformType = ucloud.String(transformType)
-
-		if _, err := conn.ISolationURedisGroup(req); err != nil {
-			return fmt.Errorf("error on %s to redis instance %q, %s", "ISolationURedisGroup", d.Id(), err)
-		}
-
-		d.SetPartial("transform_type")
-
-		if err := client.waitActiveStandbyRedisTransform(d.Id(), transformType); err != nil {
-			return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ISolationURedisGroup", d.Id(), err)
+		if err := transformActiveStandbyRedis(client, d); err != nil {
+			return err
 		}
 	}
 
 	// A changed restart_trigger requests a one-shot restart. Skipped while the
 	// resource is new so a freshly created instance is not restarted right away.
 	if d.HasChange("restart_trigger") && !d.IsNewResource() {
-		// RestartURedisGroup only works on a Running instance; the backend rejects
-		// an isolated one with an opaque RetCode 21018. Fail with a clear message
-		// instead (the transform branch above has already applied any Bind/UNBind
-		// requested in the same apply).
-		inst, err := client.describeActiveStandbyRedisById(d.Id())
-		if err != nil {
-			return fmt.Errorf("error on reading redis instance %q before restart, %s", d.Id(), err)
-		}
-		if inst.State != statusRunning {
-			return fmt.Errorf("cannot restart redis instance %q in state %q: the instance must be Running, set transform_type to %q to start an isolated instance first", d.Id(), inst.State, "Bind")
-		}
-
-		req := conn.NewRestartURedisGroupRequest()
-		req.GroupId = ucloud.String(d.Id())
-
-		if _, err := conn.RestartURedisGroup(req); err != nil {
-			return fmt.Errorf("error on %s to redis instance %q, %s", "RestartURedisGroup", d.Id(), err)
-		}
-
-		// commit the new trigger before waiting, so a later failure will not re-fire the restart
-		d.SetPartial("restart_trigger")
-
-		// RestartURedisGroup is async; block until the instance is back to Running
-		if err := client.waitActiveStandbyRedisRunning(d.Id()); err != nil {
-			return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "RestartURedisGroup", d.Id(), err)
+		if err := restartActiveStandbyRedis(client, d); err != nil {
+			return err
 		}
 	}
 
 	d.Partial(false)
+	return nil
+}
+
+// renameActiveStandbyRedis applies a name change through ModifyURedisGroupName.
+func renameActiveStandbyRedis(client *productClient, d *schema.ResourceData) error {
+	conn := client.umemconn
+
+	req := conn.NewModifyURedisGroupNameRequest()
+	req.GroupId = ucloud.String(d.Id())
+	req.Name = ucloud.String(d.Get("name").(string))
+
+	if _, err := conn.ModifyURedisGroupName(req); err != nil {
+		return fmt.Errorf("error on %s to redis instance %q, %s", "ModifyURedisGroupName", d.Id(), err)
+	}
+	d.SetPartial("name")
+
+	if err := client.waitActiveStandbyRedisRunning(d.Id()); err != nil {
+		return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ModifyURedisGroupName", d.Id(), err)
+	}
+	return nil
+}
+
+// resizeActiveStandbyRedis applies an instance_type change through
+// ResizeURedisGroup.
+func resizeActiveStandbyRedis(client *productClient, d *schema.ResourceData) error {
+	conn := client.umemconn
+	targetSize := getRedisCapability(d.Get("instance_type").(string))
+
+	req := conn.NewResizeURedisGroupRequest()
+	req.GroupId = ucloud.String(d.Id())
+	req.Size = ucloud.Int(targetSize)
+
+	if _, err := conn.ResizeURedisGroup(req); err != nil {
+		return fmt.Errorf("error on %s to redis instance %q, %s", "ResizeURedisGroup", d.Id(), err)
+	}
+	d.SetPartial("instance_type")
+
+	// Wait for the target size, not just "Running": the resize is async and
+	// right after ResizeURedisGroup returns the instance may still report the
+	// old size with state Running for a moment before flipping to Resizing.
+	// Waiting on Running alone returns early and the following read then
+	// writes the stale size back into state.
+	if err := client.waitActiveStandbyRedisResized(d.Id(), targetSize); err != nil {
+		return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ResizeURedisGroup", d.Id(), err)
+	}
+	return nil
+}
+
+// modifyActiveStandbyRedisPassword applies a password change through
+// ModifyURedisGroupPassword (pumemconn endpoint).
+func modifyActiveStandbyRedisPassword(client *productClient, d *schema.ResourceData) error {
+	req := client.pumemconn.NewModifyURedisGroupPasswordRequest()
+	req.GroupId = ucloud.String(d.Id())
+	req.Password = ucloud.String(d.Get("password").(string))
+
+	if _, err := client.pumemconn.ModifyURedisGroupPassword(req); err != nil {
+		return fmt.Errorf("error on %s to redis instance %q, %s", "ModifyURedisGroupPassword", d.Id(), err)
+	}
+	d.SetPartial("password")
+
+	if err := client.waitActiveStandbyRedisRunning(d.Id()); err != nil {
+		return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ModifyURedisGroupPassword", d.Id(), err)
+	}
+	return nil
+}
+
+// updateActiveStandbyRedisBackup applies an auto_backup / backup_begin_time
+// change through UpdateURedisBackupStrategy. The API takes the full strategy,
+// so both attributes are always sent; unset values fall back to the same
+// defaults used at create time ("disable" / 3 o'clock).
+func updateActiveStandbyRedisBackup(client *productClient, d *schema.ResourceData) error {
+	conn := client.umemconn
+
+	req := conn.NewUpdateURedisBackupStrategyRequest()
+	req.GroupId = ucloud.String(d.Id())
+
+	if v, ok := d.GetOkExists("backup_begin_time"); ok {
+		req.BackupTime = ucloud.String(strconv.Itoa(v.(int)))
+	} else {
+		req.BackupTime = ucloud.String("3")
+	}
+
+	if v, ok := d.GetOk("auto_backup"); ok {
+		req.AutoBackup = ucloud.String(v.(string))
+	} else {
+		req.AutoBackup = ucloud.String("disable")
+	}
+
+	if _, err := conn.UpdateURedisBackupStrategy(req); err != nil {
+		return fmt.Errorf("error on %s to redis instance %q, %s", "UpdateURedisBackupStrategy", d.Id(), err)
+	}
+
+	d.SetPartial("auto_backup")
+	d.SetPartial("backup_begin_time")
+	return nil
+}
+
+// transformActiveStandbyRedis applies a transform_type change through
+// ISolationURedisGroup: "UNBind" shuts the instance down (target state
+// ISolation), "Bind" starts it back up (target state Running). The API is
+// async and the instance still reports the OLD state right after it returns,
+// so the wait blocks until the target state of this direction is reached.
+func transformActiveStandbyRedis(client *productClient, d *schema.ResourceData) error {
+	conn := client.umemconn
+	transformType := d.Get("transform_type").(string)
+
+	req := conn.NewISolationURedisGroupRequest()
+	req.GroupId = ucloud.String(d.Id())
+	req.TransformType = ucloud.String(transformType)
+
+	if _, err := conn.ISolationURedisGroup(req); err != nil {
+		return fmt.Errorf("error on %s to redis instance %q, %s", "ISolationURedisGroup", d.Id(), err)
+	}
+
+	d.SetPartial("transform_type")
+
+	if err := client.waitActiveStandbyRedisTransform(d.Id(), transformType); err != nil {
+		return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ISolationURedisGroup", d.Id(), err)
+	}
+	return nil
+}
+
+// restartActiveStandbyRedis performs the one-shot restart requested through a
+// changed restart_trigger. RestartURedisGroup only works on a Running instance;
+// the backend rejects an isolated one with an opaque RetCode 21018, so the
+// state is checked up front and a clear error is returned instead (any
+// Bind/UNBind requested in the same apply has already been applied by the
+// transform branch, which must run before this one).
+func restartActiveStandbyRedis(client *productClient, d *schema.ResourceData) error {
+	conn := client.umemconn
+
+	inst, err := client.describeActiveStandbyRedisById(d.Id())
+	if err != nil {
+		return fmt.Errorf("error on reading redis instance %q before restart, %s", d.Id(), err)
+	}
+	if inst.State != statusRunning {
+		return fmt.Errorf("cannot restart redis instance %q in state %q: the instance must be Running, set transform_type to %q to start an isolated instance first", d.Id(), inst.State, "Bind")
+	}
+
+	req := conn.NewRestartURedisGroupRequest()
+	req.GroupId = ucloud.String(d.Id())
+
+	if _, err := conn.RestartURedisGroup(req); err != nil {
+		return fmt.Errorf("error on %s to redis instance %q, %s", "RestartURedisGroup", d.Id(), err)
+	}
+
+	// commit the new trigger before waiting, so a later failure will not re-fire the restart
+	d.SetPartial("restart_trigger")
+
+	// RestartURedisGroup is async; block until the instance is back to Running
+	if err := client.waitActiveStandbyRedisRunning(d.Id()); err != nil {
+		return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "RestartURedisGroup", d.Id(), err)
+	}
 	return nil
 }
 
