@@ -1,6 +1,7 @@
 package umem
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log"
 	"strconv"
@@ -447,6 +448,10 @@ func createDistributedRedisInstance(d *schema.ResourceData, meta interface{}) er
 		req.Quantity = ucloud.Int(1)
 	}
 
+	if v, ok := d.GetOk("password"); ok {
+		req.Password = ucloud.String(v.(string))
+	}
+
 	if v, ok := d.GetOk("name"); ok {
 		req.Name = ucloud.String(v.(string))
 	} else {
@@ -704,33 +709,24 @@ func restartActiveStandbyRedis(client *productClient, d *schema.ResourceData) er
 	return nil
 }
 
+// ================================================Distributed Redis helpers========================================
+
 func updateDistributedRedisInstance(d *schema.ResourceData, meta interface{}) error {
 	client, err := clientFromMeta(meta)
 	if err != nil {
 		return fmt.Errorf("error on getting client when updating redis instance, %s", err)
 	}
-	conn := client.umemconn
 
 	d.Partial(true)
 
+	// Each branch applies one in-place change through its own helper following
 	if d.HasChange("name") && !d.IsNewResource() {
-		req := conn.NewModifyUMemSpaceNameRequest()
-		req.SpaceId = ucloud.String(d.Id())
-		req.Name = ucloud.String(d.Get("name").(string))
-		// the UMemSpace API family validates the zone common param on the backend
-		req.Zone = ucloud.String(d.Get("availability_zone").(string))
-
-		_, err := conn.ModifyUMemSpaceName(req)
-		if err != nil {
-			return fmt.Errorf("error on %s to redis instance %q, %s", "ModifyUMemSpaceName", d.Id(), err)
-		}
-		d.SetPartial("name")
-
-		if err := client.waitDistributedRedisRunning(d.Id()); err != nil {
-			return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ModifyUMemSpaceName", d.Id(), err)
+		if err := renameDistributedRedis(client, d); err != nil {
+			return err
 		}
 	}
 
+	// The backend does not support changing the shard count of a distributed redis
 	if d.HasChange("instance_type") && !d.IsNewResource() {
 		if err := resizeDistributedRedisInstance(client, d); err != nil {
 			return err
@@ -738,9 +734,68 @@ func updateDistributedRedisInstance(d *schema.ResourceData, meta interface{}) er
 		d.SetPartial("instance_type")
 	}
 
+	// password
+	if d.HasChange("password") && !d.IsNewResource() {
+		if err := modifyDistributedRedisPassword(client, d); err != nil {
+			return err
+		}
+	}
+
 	d.Partial(false)
 
 	return readDistributedRedisInstance(d, meta)
+}
+
+// renameDistributedRedis applies a name change through ModifyUMemSpaceName.
+func renameDistributedRedis(client *productClient, d *schema.ResourceData) error {
+	conn := client.umemconn
+
+	req := conn.NewModifyUMemSpaceNameRequest()
+	req.SpaceId = ucloud.String(d.Id())
+	req.Name = ucloud.String(d.Get("name").(string))
+	// the UMemSpace API family validates the zone common param on the backend
+	req.Zone = ucloud.String(d.Get("availability_zone").(string))
+
+	_, err := conn.ModifyUMemSpaceName(req)
+	if err != nil {
+		return fmt.Errorf("error on %s to redis instance %q, %s", "ModifyUMemSpaceName", d.Id(), err)
+	}
+	d.SetPartial("name")
+
+	if err := client.waitDistributedRedisRunning(d.Id()); err != nil {
+		return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ModifyUMemSpaceName", d.Id(), err)
+	}
+	return nil
+}
+
+// modifyDistributedRedisPassword applies a password change through ModifyUMemPassword.
+// Two API-family quirks must be handled here:
+//   - Like the rest of the UMemSpace family, ModifyUMemPassword validates the
+//     zone common param on the backend ("Missing Params [zone_id]" without it),
+//     so Zone is always sent even though the schema marks only SpaceId/Password
+//     as required.
+//   - Unlike CreateUMemSpace (and unlike the private SDK's
+//     ModifyURedisGroupPassword used for active-standby), the public SDK does
+//     NOT base64-encode the password for ModifyUMemPassword; the API requires
+//     the encoded form, so encode it here.
+func modifyDistributedRedisPassword(client *productClient, d *schema.ResourceData) error {
+	conn := client.umemconn
+
+	req := conn.NewModifyUMemPasswordRequest()
+	req.SpaceId = ucloud.String(d.Id())
+	req.Zone = ucloud.String(d.Get("availability_zone").(string))
+	req.Password = ucloud.String(base64.StdEncoding.EncodeToString([]byte(d.Get("password").(string))))
+
+	_, err := conn.ModifyUMemPassword(req)
+	if err != nil {
+		return fmt.Errorf("error on %s to redis instance %q, %s", "ModifyUMemPassword", d.Id(), err)
+	}
+	d.SetPartial("password")
+
+	if err := client.waitDistributedRedisRunning(d.Id()); err != nil {
+		return fmt.Errorf("error on waiting for %s complete to redis instance %q, %s", "ModifyUMemPassword", d.Id(), err)
+	}
+	return nil
 }
 
 func readActiveStandbyRedisInstance(d *schema.ResourceData, meta interface{}) error {
